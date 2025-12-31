@@ -1,0 +1,774 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Geometry Dash Core</title>
+    <style>
+        body,
+        html {
+            margin: 0;
+            padding: 0;
+            width: 100%;
+            height: 100%;
+            background-color: #000;
+            overflow: hidden;
+            touch-action: none;
+            /* Prevent mobile scrolling */
+            user-select: none;
+            -webkit-user-select: none;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+        }
+
+        canvas {
+            display: block;
+        }
+
+        #ui-layer {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            pointer-events: none;
+            display: flex;
+            justify-content: center;
+            align-items: flex-start;
+            padding-top: 20px;
+        }
+
+        #score-display {
+            color: white;
+            font-size: 24px;
+            font-weight: bold;
+            text-shadow: 2px 2px 0 #000;
+            opacity: 0.8;
+        }
+
+        #intro-overlay {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0, 0, 0, 0.5);
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            color: white;
+            pointer-events: none;
+            /* Let clicks pass through to start */
+            transition: opacity 0.5s;
+        }
+    </style>
+</head>
+
+<body>
+
+    <canvas id="gameCanvas"></canvas>
+
+    <div id="ui-layer">
+        <div id="score-display">ATTEMPT 1</div>
+    </div>
+    <div id="intro-overlay">
+        <h1 style="margin:0; font-size: 40px; text-shadow: 3px 3px 0 #000;">GEOMETRY CORE</h1>
+        <p style="font-size: 18px; text-shadow: 1px 1px 0 #000;">Click, Space, or Tap to Jump</p>
+    </div>
+
+    <script>
+        /**
+         * GEOMETRY DASH CORE ENGINE
+         * * Architecture:
+         * - Fixed Timestep Loop (120hz physics) for determinism.
+         * - Entity-Component-System style data for level objects.
+         * - Canvas API for rendering.
+         * - State machine for Player.
+         */
+
+        // ==========================================
+        // CONSTANTS & CONFIG
+        // ==========================================
+
+        const CONFIG = {
+            PHYSICS_TPS: 120,          // Ticks per second (Logic rate)
+            GRAVITY: -105.0,           // Units/sec^2 (Negative is down in visual Y, but we use Y-up logic or invert?) 
+            // Let's use standard graphics coords: Y increases DOWN.
+            // So Gravity is POSITIVE.
+            GRAVITY_VAL: 120.0,        // Strong gravity for snappy feel
+            JUMP_FORCE: -21.5,         // Initial Y velocity on jump (Negative moves up)
+            ORB_FORCE: -18.0,          // Yellow orb force (slightly lower than ground jump usually, or similar)
+            MOVE_SPEED: 10.4,          // Horizontal units per second
+            TERMINAL_VELOCITY: 30.0,
+
+            // sizing
+            BLOCK_SIZE: 60,            // Pixels per logical unit (rendering scale)
+            PLAYER_SIZE: 1.0,          // Logical size (1x1 block)
+            HITBOX_SHRINK: 0.2,        // Skin width to prevent visual floating
+            SPIKE_HITBOX_W: 0.4,       // Narrower hitbox for spikes to be forgiving
+            SPIKE_HITBOX_H: 0.5,
+
+            // Visuals
+            COLORS: {
+                BG_TOP: '#2a6db5',
+                BG_BOTTOM: '#1a4d85',
+                GROUND: '#0d2d52',
+                GROUND_LINE: '#ffffff',
+                PLAYER_FILL: '#f6d123', // Classic icon colors
+                PLAYER_OUTLINE: '#000000',
+                PLAYER_INNER: '#17e3e3',
+                BLOCK_OUTLINE: '#ffffff',
+                BLOCK_FILL: '#000000', // Often transparent or dark in GD
+                SPIKE_FILL: '#000000',
+                SPIKE_OUTLINE: '#ffffff',
+                ORB_YELLOW: '#ffdd00',
+                PARTICLE_DEATH: '#ffaa00'
+            }
+        };
+
+        // ==========================================
+        // INPUT SYSTEM
+        // ==========================================
+
+        const Input = {
+            held: false,
+            pressed: false, // active for one tick
+
+            reset() {
+                this.pressed = false;
+            },
+
+            onDown() {
+                if (!this.held) {
+                    this.pressed = true;
+                }
+                this.held = true;
+
+                // Hide intro
+                const intro = document.getElementById('intro-overlay');
+                if (intro && intro.style.opacity !== '0') {
+                    intro.style.opacity = '0';
+                }
+            },
+
+            onUp() {
+                this.held = false;
+                this.pressed = false;
+            }
+        };
+
+        window.addEventListener('keydown', (e) => {
+            if (e.code === 'Space' || e.code === 'ArrowUp') {
+                Input.onDown();
+                e.preventDefault(); // prevent scrolling
+            }
+        });
+        window.addEventListener('keyup', (e) => {
+            if (e.code === 'Space' || e.code === 'ArrowUp') Input.onUp();
+        });
+        window.addEventListener('mousedown', (e) => Input.onDown());
+        window.addEventListener('mouseup', (e) => Input.onUp());
+        window.addEventListener('touchstart', (e) => { Input.onDown(); e.preventDefault(); }, { passive: false });
+        window.addEventListener('touchend', (e) => { Input.onUp(); e.preventDefault(); });
+
+
+        // ==========================================
+        // MATH & UTILS
+        // ==========================================
+
+        class Vec2 {
+            constructor(x, y) { this.x = x; this.y = y; }
+        }
+
+        function rectIntersect(r1, r2) {
+            return !(r2.x > r1.x + r1.w ||
+                r2.x + r2.w < r1.x ||
+                r2.y > r1.y + r1.h ||
+                r2.y + r2.h < r1.y);
+        }
+
+        // ==========================================
+        // GAME STATE
+        // ==========================================
+
+        const OBJ_TYPE = { BLOCK: 0, SPIKE: 1, ORB: 2, SLAB: 3 };
+
+        class Game {
+            constructor() {
+                this.canvas = document.getElementById('gameCanvas');
+                this.ctx = this.canvas.getContext('2d', { alpha: false });
+                this.resize();
+                window.addEventListener('resize', () => this.resize());
+
+                // Level Data
+                this.levelObjects = [];
+                this.generateLevel();
+
+                // State
+                this.reset();
+
+                // Timing
+                this.lastTime = 0;
+                this.accumulator = 0;
+                this.dt = 1.0 / CONFIG.PHYSICS_TPS;
+
+                // Visuals
+                this.particles = [];
+                this.cameraX = 0;
+                this.bgOffset = 0;
+
+                this.loop = this.loop.bind(this);
+                requestAnimationFrame(this.loop);
+            }
+
+            resize() {
+                this.canvas.width = window.innerWidth;
+                this.canvas.height = window.innerHeight;
+            }
+
+            reset() {
+                this.player = {
+                    pos: new Vec2(0, 0),
+                    vel: new Vec2(CONFIG.MOVE_SPEED, 0),
+                    angle: 0,
+                    onGround: true,
+                    isDead: false,
+                    deathTimer: 0
+                };
+                this.attemptCount = (this.attemptCount || 0) + 1;
+                document.getElementById('score-display').innerText = `ATTEMPT ${this.attemptCount}`;
+
+                this.cameraX = 0;
+                this.particles = [];
+            }
+
+            generateLevel() {
+                // [Type, X (grid), Y (grid), Width (optional), Height (optional)]
+                // Y=0 is the floor. Y=1 is one block up.
+                // Procedural generation for infinite-like play or structured data
+
+                const data = [
+                    // Safe start
+
+                    // First jump
+                    [OBJ_TYPE.SPIKE, 8, 0],
+                    [OBJ_TYPE.SPIKE, 12, 0],
+                    [OBJ_TYPE.SPIKE, 13, 0],
+
+                    // Block stairs
+                    [OBJ_TYPE.BLOCK, 18, 0], // Block on ground
+                    [OBJ_TYPE.SPIKE, 22, 0],
+                    [OBJ_TYPE.BLOCK, 25, 1], // Air block
+                    [OBJ_TYPE.SPIKE, 25, 0], // Spike under it
+
+                    // Gap jump
+                    [OBJ_TYPE.BLOCK, 29, 2],
+                    [OBJ_TYPE.BLOCK, 30, 2],
+                    [OBJ_TYPE.SPIKE, 33, 0],
+                    [OBJ_TYPE.SPIKE, 34, 0],
+                    [OBJ_TYPE.SPIKE, 35, 0],
+
+                    // Orb introduction
+                    [OBJ_TYPE.BLOCK, 39, 1],
+                    [OBJ_TYPE.ORB, 43, 3], // High orb
+                    [OBJ_TYPE.BLOCK, 47, 2],
+
+                    // Tricky section
+                    [OBJ_TYPE.SPIKE, 51, 0],
+                    [OBJ_TYPE.SPIKE, 52, 0],
+                    [OBJ_TYPE.BLOCK, 54, 0],
+                    [OBJ_TYPE.SPIKE, 55, 1], // Spike ON block
+                    [OBJ_TYPE.BLOCK, 56, 0],
+
+                    // Drop down
+                    [OBJ_TYPE.BLOCK, 60, 1],
+                    [OBJ_TYPE.BLOCK, 61, 1],
+                    [OBJ_TYPE.SPIKE, 64, 0],
+
+                    // Big Orb Chain
+                    [OBJ_TYPE.ORB, 68, 2],
+                    [OBJ_TYPE.ORB, 72, 3],
+                    [OBJ_TYPE.ORB, 76, 2],
+                    [OBJ_TYPE.BLOCK, 80, 1],
+
+                    // Tight squeeze
+                    [OBJ_TYPE.BLOCK, 85, 0],
+                    [OBJ_TYPE.BLOCK, 85, 2], // Head hitter if jumped too high
+
+                ];
+
+                // Procedurally extend
+                let xCursor = 90;
+                for (let i = 0; i < 100; i++) {
+                    const r = Math.random();
+                    if (r < 0.3) {
+                        // Triple spike
+                        data.push([OBJ_TYPE.SPIKE, xCursor, 0]);
+                        data.push([OBJ_TYPE.SPIKE, xCursor + 1, 0]);
+                        data.push([OBJ_TYPE.SPIKE, xCursor + 2, 0]);
+                        xCursor += 8;
+                    } else if (r < 0.6) {
+                        // Platform jump
+                        data.push([OBJ_TYPE.BLOCK, xCursor, 1]);
+                        data.push([OBJ_TYPE.SPIKE, xCursor + 3, 0]);
+                        data.push([OBJ_TYPE.BLOCK, xCursor + 5, 2]);
+                        xCursor += 10;
+                    } else {
+                        // Orb
+                        data.push([OBJ_TYPE.SPIKE, xCursor + 2, 0]);
+                        data.push([OBJ_TYPE.ORB, xCursor + 2, 2]);
+                        data.push([OBJ_TYPE.BLOCK, xCursor + 6, 1]);
+                        xCursor += 10;
+                    }
+                }
+
+                this.levelObjects = data.map(d => ({
+                    type: d[0],
+                    x: d[1],
+                    y: d[2],
+                    w: d[3] || 1,
+                    h: d[4] || 1,
+                    active: true // For orbs/coins
+                }));
+            }
+
+            // ==========================================
+            // PHYSICS ENGINE
+            // ==========================================
+
+            update(dt) {
+                if (this.player.isDead) {
+                    this.player.deathTimer -= dt;
+                    if (this.player.deathTimer <= 0) {
+                        this.reset();
+                    }
+                    return;
+                }
+
+                const p = this.player;
+
+                // 1. Apply Gravity
+                p.vel.y += CONFIG.GRAVITY_VAL * dt;
+                if (p.vel.y > CONFIG.TERMINAL_VELOCITY) p.vel.y = CONFIG.TERMINAL_VELOCITY;
+
+                // 2. Horizontal Movement
+                p.pos.x += p.vel.x * dt;
+
+                // 3. Vertical Integration (Prediction for collision)
+                let nextY = p.pos.y + p.vel.y * dt;
+
+                // 4. Ground Collision (Floor at Y=0)
+                // Note: Logical Y=0 is the top of the floor blocks.
+                // Visual rendering will offset this.
+                if (nextY >= 0) { // Positive Y is down? No, let's keep Y=0 as ground line. 
+                    // Wait, in canvas Y is down. 
+                    // Let's use: Y increases UP in logic to make sense of "Jump Height".
+                    // Logic: Y=0 is ground. Y+ is air. Gravity is Negative.
+                    // Wait, my config said Gravity Positive. 
+                    // Let's swap to standard Cartestian for logic to avoid headache.
+                    // Logic: Y=0 ground. Y+ is up. Gravity is Negative.
+                }
+            }
+
+            // Redoing Update for Cartesian Y-Up Logic
+            // Logic: X+ Right, Y+ Up.
+            // Ground is at Y=0.
+            physicsStep(dt) {
+                const p = this.player;
+                if (p.isDead) return;
+
+                // Apply input (Jump) if on ground
+                // Input processing happens before physics integration
+                if (Input.held && p.onGround) {
+                    p.vel.y = CONFIG.JUMP_FORCE; // Velocity is positive UP
+                    p.onGround = false;
+                }
+
+                // Apply Forces
+                // Gravity (Down is negative Y)
+                // Wait, if Y is up, Gravity should be negative.
+                // Let's adjust constants for Y-UP logic.
+                const GRAVITY = -CONFIG.GRAVITY_VAL;
+                const JUMP = -CONFIG.JUMP_FORCE; // Make JUMP POSITIVE
+
+                // Re-fix constants locally for sanity
+                // Logic: Y=0 is floor. Y increases UP.
+                // Gravity pulls DOWN (-). Jump pushes UP (+).
+
+                p.vel.y += -120.0 * dt; // Gravity
+
+                // Input: Jump
+                // Jump buffering or Just Pressed? GD is Just Pressed mostly for ground, Hold for repeat?
+                // Actually GD is: Hold to jump immediately when touching ground.
+                if (Input.held && p.onGround) {
+                    p.vel.y = 21.5; // Jump Force
+                    p.onGround = false;
+                    // Rotation Logic start
+                    // Snap angle to nearest 90
+                    p.angle = Math.round(p.angle / (Math.PI / 2)) * (Math.PI / 2);
+                }
+
+                // Apply Velocity
+                p.pos.x += p.vel.x * dt;
+                p.pos.y += p.vel.y * dt;
+
+                // Rotation
+                if (!p.onGround) {
+                    p.angle -= 6.0 * dt; // Rotate clockwise (negative radians)
+                } else {
+                    // Snap to nearest 90 visually or physically? 
+                    // In GD, cube snaps when landing.
+                    const target = Math.round(p.angle / (Math.PI / 2)) * (Math.PI / 2);
+                    p.angle = target;
+                }
+
+                p.onGround = false; // Assume air, prove ground
+
+                // Collision Bounds
+                // Player Box (Logic Coordinates)
+                // We use a slightly smaller hitbox for collision than visual size
+                const skin = 0.05;
+                const playerRect = {
+                    x: p.pos.x + skin,
+                    y: p.pos.y + skin,
+                    w: 1.0 - skin * 2,
+                    h: 1.0 - skin * 2
+                };
+
+                // Floor Collision
+                if (p.pos.y <= 0) {
+                    p.pos.y = 0;
+                    p.vel.y = 0;
+                    p.onGround = true;
+                }
+
+                // Object Collision
+                // Optimization: Only check objects near player X
+                const checkRadius = 5;
+
+                for (let obj of this.levelObjects) {
+                    if (obj.x > p.pos.x + checkRadius || obj.x + obj.w < p.pos.x - checkRadius) continue;
+
+                    // Construct Object Rect
+                    const objRect = { x: obj.x, y: obj.y, w: obj.w, h: obj.h };
+
+                    if (obj.type === OBJ_TYPE.BLOCK) {
+                        // AABB Check
+                        if (rectIntersect(playerRect, objRect)) {
+                            // Resolve Collision
+                            // Determine entry side
+                            // We look at previous frame position to know intended direction (omitted here for simplicity, using overlap analysis)
+
+                            // Detailed resolution:
+                            // 1. Calculate overlaps
+                            const overlapX = (playerRect.w + objRect.w) / 2 - Math.abs((playerRect.x + playerRect.w / 2) - (objRect.x + objRect.w / 2));
+                            const overlapY = (playerRect.h + objRect.h) / 2 - Math.abs((playerRect.y + playerRect.h / 2) - (objRect.y + objRect.h / 2));
+
+                            // In GD, if you hit the side, you die. If you hit the top (while falling), you land.
+                            // If you hit the bottom (head), you die.
+
+                            // To distinguish Top Landing vs Side Impact:
+                            // If the player's bottom (prev frame or just heuristic) was above the block top
+                            // AND velocity is downwards.
+
+                            // Simple heuristic: If overlapY is small and we are falling/at bottom of player rect
+                            // Actually, precise way:
+                            const pBottom = p.pos.y;
+                            const bTop = obj.y + obj.h;
+                            const bBottom = obj.y;
+
+                            // We are 'landing' if we are falling and our previous Y was >= block Top.
+                            // Since we don't store prev pos explicitly in this simplified loop, we use a tolerance.
+                            // If the player is significantly above the block center, and overlap Y is smaller than X overlap (collision is mostly vertical)
+
+                            const verticalCol = overlapY < overlapX;
+                            const falling = p.vel.y <= 0;
+                            const above = p.pos.y + 0.2 >= obj.y + obj.h; // +tolerance
+
+                            if (verticalCol && falling && above) {
+                                // Landed
+                                p.pos.y = obj.y + obj.h;
+                                p.vel.y = 0;
+                                p.onGround = true;
+                            } else {
+                                // Crash
+                                this.die();
+                                return;
+                            }
+                        }
+                    }
+                    else if (obj.type === OBJ_TYPE.SPIKE) {
+                        // Shrink spike hitbox
+                        const spikeRect = {
+                            x: obj.x + 0.3,
+                            y: obj.y,
+                            w: 0.4,
+                            h: 0.6
+                        };
+                        if (rectIntersect(playerRect, spikeRect)) {
+                            this.die();
+                            return;
+                        }
+                    }
+                    else if (obj.type === OBJ_TYPE.ORB) {
+                        if (!Input.pressed) continue; // Only trigger on fresh press (or buffered in same frame)
+
+                        // Circle collision (or simple box for perf)
+                        // Orbs center at x+0.5, y+0.5
+                        const orbX = obj.x + 0.5;
+                        const orbY = obj.y + 0.5;
+                        const pCenterX = p.pos.x + 0.5;
+                        const pCenterY = p.pos.y + 0.5;
+
+                        const dx = pCenterX - orbX;
+                        const dy = pCenterY - orbY;
+                        const distSq = dx * dx + dy * dy;
+
+                        // Orb radius approx 0.5
+                        if (distSq < 0.6) {
+                            // Trigger Orb
+                            p.vel.y = 18.0; // Orb Bounce Force
+                            p.onGround = false;
+                            Input.pressed = false; // Consume input so we don't double jump or buffer oddly
+                            this.spawnParticles(orbX, orbY, CONFIG.COLORS.ORB_YELLOW, 10);
+                        }
+                    }
+                }
+
+                // Reset input pressed flag for next tick (consumes the "frame" input)
+                Input.pressed = false;
+            }
+
+            die() {
+                if (this.player.isDead) return;
+                this.player.isDead = true;
+                this.player.deathTimer = 0.5; // seconds wait
+                this.spawnParticles(this.player.pos.x + 0.5, this.player.pos.y + 0.5, CONFIG.COLORS.PLAYER_FILL, 30);
+            }
+
+            spawnParticles(x, y, color, count) {
+                for (let i = 0; i < count; i++) {
+                    const angle = Math.random() * Math.PI * 2;
+                    const speed = Math.random() * 10 + 5;
+                    this.particles.push({
+                        x: x, y: y,
+                        vx: Math.cos(angle) * speed,
+                        vy: Math.sin(angle) * speed,
+                        life: 1.0,
+                        color: color
+                    });
+                }
+            }
+
+            // ==========================================
+            // RENDERER
+            // ==========================================
+
+            draw() {
+                const ctx = this.ctx;
+                const w = this.canvas.width;
+                const h = this.canvas.height;
+                const bs = CONFIG.BLOCK_SIZE;
+
+                // Clear
+                ctx.fillStyle = CONFIG.COLORS.BG_TOP;
+                // Gradient BG
+                const grad = ctx.createLinearGradient(0, 0, 0, h);
+                grad.addColorStop(0, CONFIG.COLORS.BG_TOP);
+                grad.addColorStop(1, CONFIG.COLORS.BG_BOTTOM);
+                ctx.fillStyle = grad;
+                ctx.fillRect(0, 0, w, h);
+
+                // Camera setup
+                // We want player to be at roughly 30% of screen width
+                // Camera Y is usually fixed to ground unless player goes high
+                const targetCamX = this.player.pos.x * bs - w * 0.3;
+                // Smooth camera? No, physics camera is locked in X usually.
+                this.cameraX = targetCamX;
+
+                // Calculate ground Y on screen
+                // Logic Y=0 is ground top.
+                // Screen Y: h - 100 (floor height)
+                const floorY = h - 150;
+
+                // Transform function
+                const toScreenX = (logicX) => Math.floor(logicX * bs - this.cameraX);
+                const toScreenY = (logicY) => Math.floor(floorY - logicY * bs);
+
+                // Draw Ground/Grid
+                // Background Grid (Parallax)
+                ctx.lineWidth = 1;
+                ctx.strokeStyle = 'rgba(255,255,255,0.1)';
+                const gridOffX = -(this.cameraX * 0.5) % bs;
+                ctx.beginPath();
+                for (let i = 0; i < w / bs + 1; i++) {
+                    ctx.moveTo(i * bs + gridOffX, 0);
+                    ctx.lineTo(i * bs + gridOffX, h);
+                }
+                ctx.moveTo(0, floorY);
+                ctx.lineTo(w, floorY);
+                ctx.stroke();
+
+                // Draw Floor Fill
+                ctx.fillStyle = CONFIG.COLORS.GROUND;
+                ctx.fillRect(0, floorY, w, h - floorY);
+                ctx.strokeStyle = CONFIG.COLORS.GROUND_LINE;
+                ctx.lineWidth = 2;
+                ctx.beginPath();
+                ctx.moveTo(0, floorY);
+                ctx.lineTo(w, floorY);
+                ctx.stroke();
+
+                // Draw Objects
+                // Cull objects
+                const startIdx = Math.floor(this.cameraX / bs) - 2;
+                const endIdx = startIdx + Math.ceil(w / bs) + 4;
+
+                for (let obj of this.levelObjects) {
+                    if (obj.x < startIdx || obj.x > endIdx) continue;
+
+                    const sx = toScreenX(obj.x);
+                    const sy = toScreenY(obj.y + obj.h); // Top left of logic rect
+                    const sw = obj.w * bs;
+                    const sh = obj.h * bs;
+
+                    if (obj.type === OBJ_TYPE.BLOCK) {
+                        ctx.fillStyle = CONFIG.COLORS.BLOCK_FILL; // Transparent/Black
+                        ctx.fillRect(sx, sy, sw, sh);
+                        ctx.strokeStyle = CONFIG.COLORS.BLOCK_OUTLINE;
+                        ctx.lineWidth = 2;
+                        ctx.strokeRect(sx, sy, sw, sh);
+
+                        // Inner detail
+                        ctx.globalAlpha = 0.3;
+                        ctx.fillStyle = CONFIG.COLORS.BLOCK_OUTLINE;
+                        ctx.fillRect(sx + 4, sy + 4, sw - 8, sh - 8);
+                        ctx.globalAlpha = 1.0;
+                    }
+                    else if (obj.type === OBJ_TYPE.SPIKE) {
+                        // Triangle
+                        ctx.fillStyle = CONFIG.COLORS.SPIKE_FILL;
+                        ctx.strokeStyle = CONFIG.COLORS.SPIKE_OUTLINE;
+                        ctx.lineWidth = 2;
+                        ctx.beginPath();
+                        // Logic: spike is 1x1 usually visually, hitbox smaller
+                        // Base
+                        ctx.moveTo(sx + 5, toScreenY(obj.y));
+                        ctx.lineTo(sx + sw - 5, toScreenY(obj.y));
+                        // Tip
+                        ctx.lineTo(sx + sw / 2, toScreenY(obj.y + obj.h));
+                        ctx.closePath();
+                        ctx.fill();
+                        ctx.stroke();
+                    }
+                    else if (obj.type === OBJ_TYPE.ORB) {
+                        const cx = sx + sw / 2;
+                        const cy = toScreenY(obj.y) - sh / 2; // Center
+
+                        // Pulsing effect
+                        const pulse = Math.sin(Date.now() / 100) * 0.1 + 1.0;
+
+                        ctx.fillStyle = 'rgba(0,0,0,0.5)';
+                        ctx.beginPath();
+                        ctx.arc(cx, cy, (sw / 2) * 0.8, 0, Math.PI * 2);
+                        ctx.fill();
+
+                        ctx.strokeStyle = CONFIG.COLORS.ORB_YELLOW;
+                        ctx.lineWidth = 4;
+                        ctx.beginPath();
+                        ctx.arc(cx, cy, (sw / 2) * 0.6 * pulse, 0, Math.PI * 2);
+                        ctx.stroke();
+
+                        ctx.fillStyle = CONFIG.COLORS.ORB_YELLOW;
+                        ctx.beginPath();
+                        ctx.arc(cx, cy, (sw / 2) * 0.2, 0, Math.PI * 2);
+                        ctx.fill();
+                    }
+                }
+
+                // Draw Player
+                if (!this.player.isDead) {
+                    const p = this.player;
+                    const px = toScreenX(p.pos.x + 0.5); // Center for rotation
+                    const py = toScreenY(p.pos.y + 0.5);
+
+                    ctx.save();
+                    ctx.translate(px, py);
+                    ctx.rotate(-p.angle); // Visual rotation
+
+                    const sz = bs * CONFIG.PLAYER_SIZE;
+                    const hsz = sz / 2;
+
+                    ctx.fillStyle = CONFIG.COLORS.PLAYER_FILL;
+                    ctx.fillRect(-hsz, -hsz, sz, sz);
+
+                    ctx.strokeStyle = CONFIG.COLORS.PLAYER_OUTLINE;
+                    ctx.lineWidth = 2;
+                    ctx.strokeRect(-hsz, -hsz, sz, sz);
+
+                    // Inner face
+                    const isz = sz * 0.4;
+                    ctx.fillStyle = CONFIG.COLORS.PLAYER_INNER;
+                    ctx.fillRect(-isz / 2, -isz / 2, isz, isz);
+                    ctx.strokeRect(-isz / 2, -isz / 2, isz, isz);
+
+                    ctx.restore();
+                }
+
+                // Draw Particles
+                for (let p of this.particles) {
+                    const sx = toScreenX(p.x);
+                    const sy = toScreenY(p.y);
+                    ctx.fillStyle = p.color;
+                    ctx.globalAlpha = p.life;
+                    ctx.fillRect(sx, sy, 5, 5);
+                    ctx.globalAlpha = 1.0;
+                }
+            }
+
+            loop(timestamp) {
+                if (!this.lastTime) this.lastTime = timestamp;
+                const frameTime = (timestamp - this.lastTime) / 1000;
+                this.lastTime = timestamp;
+
+                // Cap frameTime to prevent spiral of death
+                let dt = frameTime;
+                if (dt > 0.1) dt = 0.1;
+
+                this.accumulator += dt;
+
+                // Fixed Timestep Logic
+                while (this.accumulator >= this.dt) {
+                    this.physicsStep(this.dt);
+
+                    // Update particles in physics loop for consistency? 
+                    // Usually visual, but let's keep it here for simplicity
+                    for (let i = this.particles.length - 1; i >= 0; i--) {
+                        const p = this.particles[i];
+                        p.x += p.vx * this.dt;
+                        p.y += p.vy * this.dt;
+                        p.vy += -10.0 * this.dt; // Gravity
+                        p.life -= 2.0 * this.dt;
+                        if (p.life <= 0) this.particles.splice(i, 1);
+                    }
+
+                    this.accumulator -= this.dt;
+                }
+
+                // Render
+                this.draw();
+
+                requestAnimationFrame(this.loop);
+            }
+        }
+
+        // Start Game
+        window.onload = () => {
+            const game = new Game();
+        };
+
+    </script>
+</body>
+
+</html>
